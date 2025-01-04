@@ -1,149 +1,120 @@
 package main
 
 import (
-	"crypto/tls"
-	"encoding/json"
 	"log"
-	"math/rand"
 	"net/http"
 	"sync"
-	"time"
 
+	"github.com/IBM/sarama"
 	"github.com/gorilla/websocket"
 )
 
-// Order представляет одну запись в списке ордеров.
-type Order struct {
-	Price  float64 `json:"price"`
-	Amount float64 `json:"amount"`
+// Настройки WebSocket
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
 }
 
-// OrderBook представляет книгу ордеров.
-type OrderBook struct {
-	BuyOrders  []Order `json:"buyOrders"`
-	SellOrders []Order `json:"sellOrders"`
-}
-
-// WebSocketServer содержит подключенных клиентов и логику.
-type WebSocketServer struct {
-	clients   map[*websocket.Conn]bool // Подключенные клиенты
-	upgrader  websocket.Upgrader       // Для обновления соединения до WebSocket
-	mu        sync.Mutex               // Защита доступа к clients
-	broadcast chan OrderBook           // Канал для отправки сообщений
-}
-
-// NewWebSocketServer создает новый экземпляр WebSocket-сервера.
-func NewWebSocketServer() *WebSocketServer {
-	return &WebSocketServer{
-		clients:   make(map[*websocket.Conn]bool),
-		upgrader:  websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }},
-		broadcast: make(chan OrderBook),
-	}
-}
-
-// HandleConnections обрабатывает новые подключения WebSocket.
-func (server *WebSocketServer) HandleConnections(w http.ResponseWriter, r *http.Request) {
-	conn, err := server.upgrader.Upgrade(w, r, nil)
+// WebSocket handler
+func wsHandler(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println("Ошибка подключения клиента:", err)
+		log.Println("Error upgrading connection:", err)
 		return
 	}
 	defer conn.Close()
 
-	server.mu.Lock()
-	server.clients[conn] = true
-	server.mu.Unlock()
+	// Create a channel for sending WebSocket messages
+	messageChannel := make(chan []byte)
 
-	log.Println("Клиент подключен")
+	// Start a goroutine for writing to the WebSocket
+	go writeToWebSocket(conn, messageChannel)
 
-	// Ожидание завершения соединения.
-	for {
-		_, _, err := conn.ReadMessage()
+	// Setup Kafka consumer to subscribe to "orderbook", "pnl", and "wallet" topics concurrently
+	var wg sync.WaitGroup
+
+	// Start consuming messages from the "orderbook" topic
+	wg.Add(1)
+	go consumeMessages("orderbook", conn, messageChannel, &wg)
+
+	// Start consuming messages from the "pnl" topic
+	wg.Add(1)
+	go consumeMessages("pnl", conn, messageChannel, &wg)
+
+	// Start consuming messages from the "wallet" topic
+	wg.Add(1)
+	go consumeMessages("wallet", conn, messageChannel, &wg)
+
+	// Wait for all consumers to finish
+	wg.Wait()
+}
+
+// Function to consume messages from Kafka
+func consumeMessages(topic string, conn *websocket.Conn, messageChannel chan []byte, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	// Setup Kafka consumer to subscribe to the given topic
+	consumer := startKafkaConsumer()
+	defer consumer.Close()
+
+	// Subscribe to the topic
+	partitions, err := consumer.Partitions(topic)
+	if err != nil {
+		log.Printf("Error fetching partitions for topic %s: %v\n", topic, err)
+		return
+	}
+
+	// Consume messages from each partition
+	for _, partition := range partitions {
+		pc, err := consumer.ConsumePartition(topic, partition, sarama.OffsetNewest)
 		if err != nil {
-			log.Println("Клиент отключился:", err)
-			server.mu.Lock()
-			delete(server.clients, conn)
-			server.mu.Unlock()
-			break
+			log.Printf("Error subscribing to partition %d for topic %s: %v\n", partition, topic, err)
+			return
+		}
+		defer pc.Close()
+
+		// Loop to listen for new messages
+		for message := range pc.Messages() {
+			// Логирование сырых данных (до обработки)
+			log.Printf("Received raw Kafka message from topic %s: %s\n", topic, string(message.Value))
+
+			// Send the raw message to the messageChannel for WebSocket writing
+			messageChannel <- message.Value
 		}
 	}
 }
 
-// StartBroadcasting запускает передачу данных подключенным клиентам.
-func (server *WebSocketServer) StartBroadcasting() {
-	for {
-		orderBook := <-server.broadcast
-
-		// Преобразуем OrderBook в JSON.
-		jsonData, err := json.Marshal(orderBook)
+// Function to handle WebSocket writes
+func writeToWebSocket(conn *websocket.Conn, messageChannel chan []byte) {
+	for message := range messageChannel {
+		// Write the message to WebSocket connection
+		err := conn.WriteMessage(websocket.TextMessage, message)
 		if err != nil {
-			log.Println("Ошибка сериализации данных:", err)
-			continue
+			log.Println("Error sending message over WebSocket:", err)
+			return
 		}
-
-		// Отправляем данные всем клиентам.
-		server.mu.Lock()
-		for client := range server.clients {
-			err := client.WriteMessage(websocket.TextMessage, jsonData)
-			if err != nil {
-				log.Println("Ошибка отправки сообщения клиенту:", err)
-				client.Close()
-				delete(server.clients, client)
-			}
-		}
-		server.mu.Unlock()
 	}
 }
 
-func GenerateRandomOrder(priceMin, priceMax, amountMin, amountMax float64) Order {
-	return Order{
-		Price:  priceMin + rand.Float64()*(priceMax-priceMin),
-		Amount: amountMin + rand.Float64()*(amountMax-amountMin),
+// Kafka Consumer (подписка на топик)
+func startKafkaConsumer() sarama.Consumer {
+	config := sarama.NewConfig()
+	config.Consumer.Return.Errors = true
+	consumer, err := sarama.NewConsumer([]string{"localhost:19092"}, config)
+	if err != nil {
+		log.Fatal("Error creating Kafka consumer:", err)
 	}
+	return consumer
 }
 
-// GenerateOrderBook генерирует случайные данные OrderBook.
-func GenerateOrderBook() OrderBook {
-	var buyOrders, sellOrders []Order
-
-	// Генерация случайных buyOrders.
-	for i := 0; i < 10; i++ { // Генерируем 10 случайных ордеров на покупку.
-		buyOrders = append(buyOrders, GenerateRandomOrder(100, 110, 1, 20))
-	}
-
-	// Генерация случайных sellOrders.
-	for i := 0; i < 10; i++ { // Генерируем 10 случайных ордеров на продажу.
-		sellOrders = append(sellOrders, GenerateRandomOrder(111, 120, 1, 20))
-	}
-
-	return OrderBook{
-		BuyOrders:  buyOrders,
-		SellOrders: sellOrders,
-	}
-}
-
-// main запускает сервер.
 func main() {
-	server := NewWebSocketServer()
+	// HTTP-сервер для WebSocket
+	http.HandleFunc("/ws", wsHandler)
 
-	// Обработчик WebSocket.
-	http.HandleFunc("/orderbook", server.HandleConnections)
-
-	// Отдельная горутина для рассылки данных клиентам.
-	go server.StartBroadcasting()
-
-	// Отдельная горутина для отправки новых данных.
-	go func() {
-		for {
-			time.Sleep(2 * time.Second) // Каждые 2 секунды отправляем новые данные.
-			server.broadcast <- GenerateOrderBook()
-		}
-	}()
-
-	serverConfig := &http.Server{
-		Addr: ":10999", // Используем сокращенную запись, которая включает и IPv4, и IPv6
+	// Запуск сервера
+	log.Println("Starting server on 0.0.0.0:10999")
+	if err := http.ListenAndServe("0.0.0.0:10999", nil); err != nil {
+		log.Fatal("Error starting server:", err)
 	}
-
-	log.Println("Сервер запущен на ws://localhost:10999/orderbook")
-	log.Fatal(serverConfig.ListenAndServe())
 }
