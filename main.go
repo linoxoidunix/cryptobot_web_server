@@ -46,6 +46,10 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	wg.Add(1)
 	go consumeMessages("wallet", conn, messageChannel, &wg)
 
+	// Start consuming messages from the "wallet" topic
+	wg.Add(1)
+	go consumeMessages("trade", conn, messageChannel, &wg)
+
 	// Wait for all consumers to finish
 	wg.Wait()
 }
