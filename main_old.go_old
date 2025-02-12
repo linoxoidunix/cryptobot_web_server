@@ -1,0 +1,378 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"strconv"
+	"sync"
+
+	// Путь к сгенерированным файлам
+	"cryptobot_server/aot"
+	"cryptobot_server/greeting"
+
+	"github.com/IBM/sarama"
+	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
+	"github.com/redis/go-redis/v9"
+	"google.golang.org/protobuf/proto"
+)
+
+var ctx = context.Background()
+
+// Redis клиент
+var rdb *redis.Client
+
+// Map of topic handlers
+var topicHandlers = map[string]func(chan []byte, interface{}){
+	"orderbook":        handleOrderBook,
+	"pnl":              handlePNL,
+	"wallet":           handleWallet,
+	"trade":            handleTrade,
+	"trade_dictionary": handleTradeDictionary,
+}
+
+// WebSocket upgrader settings
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
+
+// WebSocket handler
+func wsHandler(w http.ResponseWriter, r *http.Request) {
+
+	//
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println("Error upgrading connection:", err)
+		return
+	}
+	defer conn.Close()
+
+	// Create a channel for sending WebSocket messages
+	messageChannel := make(chan []byte)
+
+	// Start a goroutine for writing to the WebSocket
+	go writeToWebSocket(conn, messageChannel)
+
+	// Setup Kafka consumer to subscribe to multiple topics concurrently
+	var wg sync.WaitGroup
+	topics := []string{"orderbook", "pnl", "wallet", "trade", "trade_dictionary"}
+
+	for _, topic := range topics {
+		wg.Add(1)
+		go consumeMessages(topic, messageChannel, &wg)
+	}
+
+	// Wait for all consumers to finish
+	wg.Wait()
+}
+
+// Function to consume messages from Kafka
+func consumeMessages(topic string, messageChannel chan []byte, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	// Setup Kafka consumer to subscribe to the given topic
+	consumer := startKafkaConsumer()
+	defer consumer.Close()
+
+	// Subscribe to the topic
+	partitions, err := consumer.Partitions(topic)
+	if err != nil {
+		log.Printf("Error fetching partitions for topic %s: %v\n", topic, err)
+		return
+	}
+
+	// Consume messages from each partition
+	for _, partition := range partitions {
+		pc, err := consumer.ConsumePartition(topic, partition, sarama.OffsetNewest)
+		if err != nil {
+			log.Printf("Error subscribing to partition %d for topic %s: %v\n", partition, topic, err)
+			return
+		}
+		defer pc.Close()
+
+		// Loop to listen for new messages
+		for message := range pc.Messages() {
+			// Log raw Kafka message data (before processing)
+			log.Printf("Received raw Kafka message from topic %s: %s\n", topic, string(message.Value))
+
+			// Pass the raw message and message channel to the appropriate handler
+			if handler, exists := topicHandlers[topic]; exists {
+				handler(messageChannel, message.Value)
+			} else {
+				log.Printf("No handler defined for topic: %s", topic)
+			}
+		}
+	}
+}
+
+// Function to handle WebSocket writes
+func writeToWebSocket(conn *websocket.Conn, messageChannel chan []byte) {
+	for message := range messageChannel {
+		// Write the message to WebSocket connection
+		err := conn.WriteMessage(websocket.TextMessage, message)
+		if err != nil {
+			log.Println("Error sending message over WebSocket:", err)
+			return
+		}
+	}
+}
+
+// Kafka Consumer (subscribe to topic)
+func startKafkaConsumer() sarama.Consumer {
+	config := sarama.NewConfig()
+	config.Consumer.Return.Errors = true
+	consumer, err := sarama.NewConsumer([]string{"localhost:19092"}, config)
+	if err != nil {
+		log.Fatal("Error creating Kafka consumer:", err)
+	}
+	return consumer
+}
+
+// Example handlers for different topics
+func handleOrderBook(messageChannel chan []byte, data interface{}) {
+	// Process the orderbook data and send it to WebSocket
+	log.Println("Handling orderbook data:", data)
+
+	// Send the raw message (no parsing or marshalling required)
+	messageChannel <- data.([]byte)
+}
+
+func handlePNL(messageChannel chan []byte, data interface{}) {
+	// Process PNL data and send it to WebSocket
+	log.Println("Handling PNL data:", data)
+
+	// Send the raw message (no parsing or marshalling required)
+	messageChannel <- data.([]byte)
+}
+
+func handleWallet(messageChannel chan []byte, data interface{}) {
+	// Process wallet data and send it to WebSocket
+	log.Println("Handling wallet data:", data)
+
+	// Send the raw message (no parsing or marshalling required)
+	messageChannel <- data.([]byte)
+}
+
+func handleTrade(messageChannel chan []byte, data interface{}) {
+	// Directly pass the raw message to WebSocket
+	log.Println("Handling trade data:", data)
+
+	// Send the raw message (no parsing or marshalling required)
+	messageChannel <- data.([]byte)
+}
+
+func addTransactionToListIfNotExists(ctx context.Context, rdb *redis.Client, listKey string, transactionKey string) {
+	// Проверка существования ключа в списке
+	items, err := rdb.LRange(ctx, listKey, 0, -1).Result()
+	if err != nil {
+		log.Printf("Error retrieving list from Redis: %v", err)
+		return
+	}
+
+	// Проверка на существование элемента
+	for _, item := range items {
+		if item == transactionKey {
+			log.Printf("Transaction key '%s' already exists in list '%s'", transactionKey, listKey)
+			return
+		}
+	}
+
+	// Добавление элемента в список, если его ещё нет
+	if err := rdb.LPush(ctx, listKey, transactionKey).Err(); err != nil {
+		log.Printf("Error adding transaction to list: %v", err)
+	} else {
+		log.Printf("Transaction key '%s' added to list '%s'", transactionKey, listKey)
+	}
+}
+
+func handleTradeDictionary(messageChannel chan []byte, data interface{}) {
+	// Handle the trade dictionary
+	log.Println("Handling TradeDictionary message:", data)
+
+	var trades aot.Trades
+
+	bytes, ok := data.([]byte)
+	if ok {
+		fmt.Println("Success:", bytes)
+	} else {
+		fmt.Println("Type assertion failed")
+	}
+
+	// Десериализация
+	if err := proto.Unmarshal(bytes, &trades); err != nil {
+		log.Fatalf("Failed to unmarshal: %v", err)
+	}
+
+	// Вывод содержимого сообщения
+	for tradeID, trade := range trades.Trades {
+		fmt.Printf("Trade ID: %d\n", tradeID)
+		for id_transaction, transaction := range trade.Transactions {
+			fmt.Printf("  Trading Pair: %s\n", transaction.TradingPair)
+			fmt.Printf("  Exchange: %s\n", transaction.ExchangeId.String())
+			fmt.Printf("  Market Type: %s\n", transaction.MarketType.String())
+			fmt.Printf("  Transaction Action: %s\n\n", transaction.TransactionAction.String())
+			// Создание сложного ключа для Redis
+			redisKey := fmt.Sprintf("trade:%d:transaction:%d", tradeID, id_transaction)
+			// Сохранение в Redis хэш транзакции
+			saveTransactionToRedis(redisKey, transaction)
+			// Добавление транзакции в список транзакций для трейда
+			addTransactionToListIfNotExists(ctx, rdb, fmt.Sprintf("trade:%s:transaction:", strconv.FormatUint(tradeID, 10)), redisKey)
+		}
+	}
+
+	// Successfully marshaled the data
+	log.Println("Successfully marshaled TradeDictionary data as flat buffer")
+}
+
+// Функция для сохранения транзакции в Redis
+func saveTransactionToRedis(transactionId string, transaction *aot.Transaction) {
+	// Сохранение хэша для каждой транзакции
+	transactionData := map[string]interface{}{
+		"TradingPair":       transaction.TradingPair,
+		"Exchange":          transaction.ExchangeId.String(),
+		"MarketType":        transaction.MarketType.String(),
+		"TransactionAction": transaction.TransactionAction.String(),
+	}
+
+	// Сохраняем хэш
+	if err := rdb.HSet(ctx, transactionId, transactionData).Err(); err != nil {
+		log.Printf("Error saving transaction to Redis: %v", err)
+	}
+
+}
+
+func NewExchangeId(s string) (aot.ExchangeId, error) {
+	// Используем маппинг для получения значения перечисления из строки
+	if val, ok := aot.ExchangeId_value[s]; ok {
+		return aot.ExchangeId(val), nil
+	}
+	return aot.ExchangeId_EXCHANGE_ID_INVALID, fmt.Errorf("invalid ExchangeId: %s", s)
+}
+
+func NewMarketType(s string) (aot.MarketType, error) {
+	// Используем маппинг для получения значения перечисления из строки
+	if val, ok := aot.MarketType_value[s]; ok {
+		return aot.MarketType(val), nil
+	}
+	return aot.MarketType_MARKET_TYPE_INVALID, fmt.Errorf("invalid ExchangeId: %s", s)
+}
+
+func NewTransactionAction(s string) (aot.TransactionAction, error) {
+	// Используем маппинг для получения значения перечисления из строки
+	if val, ok := aot.TransactionAction_value[s]; ok {
+		return aot.TransactionAction(val), nil
+	}
+	return aot.TransactionAction_SELL, fmt.Errorf("invalid ExchangeId: %s", s)
+}
+
+// Функция получения транзакций из Redis для конкретного TradeID
+func getTransactionsForTradeID(tradeID uint64) ([]aot.Transaction, error) {
+	// Формируем ключ Redis для списка транзакций этого трейда
+	redisKey := fmt.Sprintf("trade:%d:transaction:", tradeID)
+
+	// Получаем все транзакции для данного трейда
+	transactionKeys, err := rdb.LRange(ctx, redisKey, 0, -1).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get transaction keys: %v", err)
+	}
+
+	// Считываем транзакции из Redis
+	var transactions []aot.Transaction
+	for _, key := range transactionKeys {
+		// Получаем хэш данных транзакции
+		data, err := rdb.HGetAll(ctx, key).Result()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get transaction data for key %s: %v", key, err)
+		}
+
+		// Преобразуем данные в структуру Transaction
+		exchangeId, err := NewExchangeId(data["ExchangeId"]) // Используем функцию NewExchangeId для преобразования строки в перечисление
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert ExchangeId: %v", err)
+		}
+
+		// Преобразуем данные в структуру Transaction
+		marketType, err := NewMarketType(data["MarketType"]) // Используем функцию NewExchangeId для преобразования строки в перечисление
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert MarketType: %v", err)
+		}
+
+		// Преобразуем данные в структуру Transaction
+		transactionAction, err := NewTransactionAction(data["TransactionAction"]) // Используем функцию NewExchangeId для преобразования строки в перечисление
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert TransactionAction: %v", err)
+		}
+		// Преобразуем данные в структуру Transaction
+		transaction := aot.Transaction{
+			TradingPair:       data["TradingPair"],
+			ExchangeId:        exchangeId,
+			MarketType:        marketType,
+			TransactionAction: transactionAction,
+		}
+
+		transactions = append(transactions, transaction)
+	}
+
+	return transactions, nil
+}
+
+// API Handler для получения списка транзакций по TradeID
+func getTransactions(c *gin.Context) {
+	// Получаем TradeID из параметров запроса
+	tradeIDParam := c.Param("tradeID")
+	tradeID, err := strconv.ParseUint(tradeIDParam, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid TradeID"})
+		return
+	}
+
+	// Получаем транзакции из Redis
+	transactions, err := getTransactionsForTradeID(tradeID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Отправляем результат в формате JSON
+	c.JSON(http.StatusOK, gin.H{"transactions": transactions})
+}
+
+func main() {
+	// Инициализация клиента Redis
+	rdb = redis.NewClient(&redis.Options{
+		Addr: "localhost:6379", // Адрес Redis
+		DB:   0,                // Используем базу данных по умолчанию
+	})
+
+	// Проверка подключения
+	_, err := rdb.Ping(ctx).Result()
+	if err != nil {
+		log.Fatalf("Error connecting to Redis: %v", err)
+	}
+	greeting.Greet("Denis")
+	// HTTP server for WebSocket
+	http.HandleFunc("/ws", wsHandler)
+
+	// Start the server
+	log.Println("Starting server on 0.0.0.0:10999")
+	if err := http.ListenAndServe("0.0.0.0:10999", nil); err != nil {
+		log.Fatal("Error starting server:", err)
+	}
+
+	// Создаем новый роутер Gin
+	r := gin.Default()
+
+	// Маршрут для получения списка транзакций по TradeID
+	r.GET("/transactions/:tradeID", getTransactions)
+
+	// Запуск сервера
+	gin_err := r.Run(":8080")
+	if gin_err != nil {
+		log.Fatalf("could not start server: %v", err)
+	}
+}
